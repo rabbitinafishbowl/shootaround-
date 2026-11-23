@@ -1,0 +1,373 @@
+//! toolbox: a BusyBox-style multi-call binary for Linux and Android.
+//! Pure std, no dependencies. Reads and drives hardware through sysfs/procfs.
+//!
+//! Build (Linux):   rustc -O toolbox.rs -o toolbox
+//! Build (Android): cargo ndk -t arm64-v8a build --release
+//! Use:             ./toolbox battery  |  ./toolbox led white:flash 255
+
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::{exit, Command};
+
+type Res = Result<(), String>;
+
+const MIN_VOLTS: f64 = 120.0;
+const MAX_VOLTS: f64 = 277.0;
+
+// ---------- helpers ----------
+
+fn read(path: impl AsRef<Path>) -> Result<String, String> {
+    let p = path.as_ref();
+    fs::read_to_string(p)
+        .map(|s| s.trim().to_string())
+        .map_err(|e| format!("{}: {e}", p.display()))
+}
+
+fn write(path: impl AsRef<Path>, val: &str) -> Res {
+    let p = path.as_ref();
+    fs::write(p, val)
+        .map_err(|e| format!("{}: {e} (root/adb shell may be required)", p.display()))
+}
+
+fn entries(dir: &str) -> Vec<PathBuf> {
+    let mut v: Vec<PathBuf> = fs::read_dir(dir)
+        .map(|rd| rd.filter_map(|e| e.ok()).map(|e| e.path()).collect())
+        .unwrap_or_default();
+    v.sort();
+    v
+}
+
+fn name_of(p: &Path) -> String {
+    p.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
+fn num(path: impl AsRef<Path>) -> Option<f64> {
+    read(path).ok()?.parse().ok()
+}
+
+fn is_android() -> bool {
+    Path::new("/system/build.prop").exists()
+}
+
+// ---------- applets ----------
+
+/// Ballast concept: accept any input from 120V to 277V.
+fn volts(a: &[String]) -> Res {
+    let raw = a.first().ok_or("usage: volts <value>")?;
+    let v: f64 = raw.parse().map_err(|_| format!("not a number: {raw}"))?;
+    if !v.is_finite() {
+        return Err("invalid voltage".into());
+    }
+    if v < MIN_VOLTS {
+        Err(format!("{v}V is below {MIN_VOLTS}V"))
+    } else if v > MAX_VOLTS {
+        Err(format!("{v}V is above {MAX_VOLTS}V"))
+    } else {
+        println!("{v}V is within the {MIN_VOLTS}V-{MAX_VOLTS}V input range");
+        Ok(())
+    }
+}
+
+fn battery(_: &[String]) -> Res {
+    let dirs = entries("/sys/class/power_supply");
+    if dirs.is_empty() {
+        return Err("no power_supply devices found".into());
+    }
+    for d in dirs {
+        println!("[{}] type={}", name_of(&d), read(d.join("type")).unwrap_or_default());
+        for key in ["status", "health", "capacity", "online", "technology"] {
+            if let Ok(v) = read(d.join(key)) {
+                println!("  {key}: {v}");
+            }
+        }
+        if let Some(v) = num(d.join("voltage_now")) {
+            println!("  voltage: {:.3} V", v / 1e6);
+        }
+        if let Some(v) = num(d.join("current_now")) {
+            println!("  current: {:.0} mA", v / 1e3);
+        }
+        if let Some(v) = num(d.join("temp")) {
+            println!("  temp: {:.1} C", v / 10.0);
+        }
+    }
+    Ok(())
+}
+
+fn thermal(_: &[String]) -> Res {
+    let mut any = false;
+    for z in entries("/sys/class/thermal") {
+        if !name_of(&z).starts_with("thermal_zone") {
+            continue;
+        }
+        if let Some(t) = num(z.join("temp")) {
+            any = true;
+            println!(
+                "{:<16} {:<20} {:.1} C",
+                name_of(&z),
+                read(z.join("type")).unwrap_or_default(),
+                t / 1000.0
+            );
+        }
+    }
+    if any { Ok(()) } else { Err("no readable thermal zones".into()) }
+}
+
+fn hwmon(_: &[String]) -> Res {
+    for h in entries("/sys/class/hwmon") {
+        println!("[{}] {}", name_of(&h), read(h.join("name")).unwrap_or_default());
+        for f in entries(h.to_str().unwrap_or("")) {
+            let n = name_of(&f);
+            if !n.ends_with("_input") {
+                continue;
+            }
+            if let Some(v) = num(&f) {
+                if n.starts_with("in") {
+                    println!("  {n}: {:.3} V", v / 1000.0);
+                } else if n.starts_with("temp") {
+                    println!("  {n}: {:.1} C", v / 1000.0);
+                } else if n.starts_with("fan") {
+                    println!("  {n}: {v:.0} rpm");
+                } else {
+                    println!("  {n}: {v}");
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn cpu(_: &[String]) -> Res {
+    println!("load: {}", read("/proc/loadavg")?);
+    for c in entries("/sys/devices/system/cpu") {
+        let n = name_of(&c);
+        if n.len() > 3 && n.starts_with("cpu") && n[3..].chars().all(|ch| ch.is_ascii_digit()) {
+            let f = num(c.join("cpufreq/scaling_cur_freq"))
+                .map(|k| format!("{:.0} MHz", k / 1000.0));
+            println!("{n}: {}", f.unwrap_or_else(|| "n/a".into()));
+        }
+    }
+    Ok(())
+}
+
+fn mem(_: &[String]) -> Res {
+    for line in read("/proc/meminfo")?.lines().take(4) {
+        println!("{line}");
+    }
+    Ok(())
+}
+
+fn uptime(_: &[String]) -> Res {
+    let s: f64 = read("/proc/uptime")?
+        .split_whitespace()
+        .next()
+        .and_then(|x| x.parse().ok())
+        .ok_or("bad /proc/uptime")?;
+    let t = s as u64;
+    println!("up {}d {}h {}m {}s", t / 86400, t % 86400 / 3600, t % 3600 / 60, t % 60);
+    Ok(())
+}
+
+fn net(_: &[String]) -> Res {
+    for line in read("/proc/net/dev")?.lines().skip(2) {
+        let (iface, rest) = line.split_once(':').ok_or("bad /proc/net/dev")?;
+        let f: Vec<&str> = rest.split_whitespace().collect();
+        if f.len() >= 9 {
+            println!("{:<10} rx {} B  tx {} B", iface.trim(), f[0], f[8]);
+        }
+    }
+    Ok(())
+}
+
+/// LEDs (includes camera flash/torch and vibrator on many devices).
+fn led(a: &[String]) -> Res {
+    let Some(name) = a.first() else {
+        for l in entries("/sys/class/leds") {
+            println!(
+                "{:<28} {}/{}",
+                name_of(&l),
+                read(l.join("brightness")).unwrap_or_default(),
+                read(l.join("max_brightness")).unwrap_or_default()
+            );
+        }
+        return Ok(());
+    };
+    let dir = Path::new("/sys/class/leds").join(name);
+    if !dir.exists() {
+        return Err(format!("no such led: {name} (run `led` to list)"));
+    }
+    match a.get(1) {
+        None => {
+            println!("{}", read(dir.join("brightness"))?);
+            Ok(())
+        }
+        Some(v) => {
+            let val: u32 = match v.as_str() {
+                "on" => num(dir.join("max_brightness")).unwrap_or(255.0) as u32,
+                "off" => 0,
+                s => s.parse().map_err(|_| format!("bad value: {s}"))?,
+            };
+            write(dir.join("brightness"), &val.to_string())
+        }
+    }
+}
+
+fn backlight(a: &[String]) -> Res {
+    let dirs = entries("/sys/class/backlight");
+    let d = dirs.first().ok_or("no backlight device")?;
+    let max = num(d.join("max_brightness")).unwrap_or(255.0);
+    match a.first() {
+        None => {
+            println!("{}/{}", read(d.join("brightness"))?, max);
+            Ok(())
+        }
+        Some(p) => {
+            let pct: f64 = p.parse().map_err(|_| "usage: backlight <0-100>".to_string())?;
+            if !(0.0..=100.0).contains(&pct) {
+                return Err("percent must be 0-100".into());
+            }
+            write(d.join("brightness"), &format!("{}", (max * pct / 100.0).round() as u64))
+        }
+    }
+}
+
+/// Vibrator via the Linux LED-class timed-output interface (device dependent).
+fn vibrate(a: &[String]) -> Res {
+    let ms: u32 = a.first().and_then(|s| s.parse().ok()).unwrap_or(200);
+    let dir = Path::new("/sys/class/leds/vibrator");
+    if !dir.exists() {
+        return Err("no /sys/class/leds/vibrator on this device".into());
+    }
+    write(dir.join("duration"), &ms.to_string())?;
+    write(dir.join("activate"), "1")
+}
+
+/// Raw sysfs GPIO (legacy interface; Linux boards such as Raspberry Pi).
+fn gpio(a: &[String]) -> Res {
+    let usage = "usage: gpio <pin> [0|1]";
+    let pin = a.first().ok_or(usage)?;
+    let dir = format!("/sys/class/gpio/gpio{pin}");
+    if !Path::new(&dir).exists() {
+        write("/sys/class/gpio/export", pin)?;
+    }
+    match a.get(1) {
+        None => {
+            write(format!("{dir}/direction"), "in")?;
+            println!("{}", read(format!("{dir}/value"))?);
+            Ok(())
+        }
+        Some(v) if v == "0" || v == "1" => {
+            write(format!("{dir}/direction"), "out")?;
+            write(format!("{dir}/value"), v)
+        }
+        _ => Err(usage.into()),
+    }
+}
+
+/// Android only: getprop wrapper.
+fn props(a: &[String]) -> Res {
+    if !is_android() {
+        return Err("props: Android only".into());
+    }
+    let out = Command::new("getprop")
+        .args(a)
+        .output()
+        .map_err(|e| format!("getprop: {e}"))?;
+    print!("{}", String::from_utf8_lossy(&out.stdout));
+    Ok(())
+}
+
+/// Android only: run a system service command.
+fn android(a: &[String]) -> Res {
+    if !is_android() {
+        return Err("android: Android only".into());
+    }
+    let (prog, rest) = a
+        .split_first()
+        .ok_or("usage: android <settings|dumpsys|cmd|am|pm|input|svc> ...")?;
+    const ALLOWED: [&str; 7] = ["settings", "dumpsys", "cmd", "am", "pm", "input", "svc"];
+    if !ALLOWED.contains(&prog.as_str()) {
+        return Err(format!("not allowed: {prog}"));
+    }
+    let st = Command::new(prog)
+        .args(rest)
+        .status()
+        .map_err(|e| format!("{prog}: {e}"))?;
+    if st.success() { Ok(()) } else { Err(format!("{prog} exited with {st}")) }
+}
+
+fn info(_: &[String]) -> Res {
+    println!("os: {}", if is_android() { "android" } else { std::env::consts::OS });
+    println!("arch: {}", std::env::consts::ARCH);
+    if let Ok(v) = read("/proc/version") {
+        println!("kernel: {v}");
+    }
+    Ok(())
+}
+
+// ---------- dispatch ----------
+
+type Applet = fn(&[String]) -> Res;
+
+const APPLETS: &[(&str, Applet, &str)] = &[
+    ("volts", volts, "volts <v>            check against 120V-277V input range"),
+    ("battery", battery, "battery              charge, voltage, current, temp"),
+    ("thermal", thermal, "thermal              temperature zones"),
+    ("hwmon", hwmon, "hwmon                voltage/temp/fan sensors"),
+    ("cpu", cpu, "cpu                  load and per-core frequency"),
+    ("mem", mem, "mem                  memory summary"),
+    ("uptime", uptime, "uptime               time since boot"),
+    ("net", net, "net                  interface byte counters"),
+    ("led", led, "led [name [on|off|n]] list or set LEDs (torch/flash)"),
+    ("backlight", backlight, "backlight [0-100]    screen brightness"),
+    ("vibrate", vibrate, "vibrate [ms]         buzz the vibrator"),
+    ("gpio", gpio, "gpio <pin> [0|1]    read/write GPIO pin"),
+    ("props", props, "props [key]          Android system properties"),
+    ("android", android, "android <cmd> ...    settings/dumpsys/cmd/am/pm/input/svc"),
+    ("info", info, "info                 platform summary"),
+];
+
+fn help() {
+    println!("toolbox applets:");
+    for (_, _, h) in APPLETS {
+        println!("  {h}");
+    }
+}
+
+fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    let exe = args
+        .first()
+        .map(|a| {
+            Path::new(a)
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        })
+        .unwrap_or_default();
+
+    // BusyBox style: symlink name wins, otherwise first argument.
+    let (name, rest): (String, &[String]) = if APPLETS.iter().any(|(n, _, _)| *n == exe) {
+        (exe, &args[1..])
+    } else if args.len() > 1 {
+        (args[1].clone(), &args[2..])
+    } else {
+        help();
+        return;
+    };
+
+    match APPLETS.iter().find(|(n, _, _)| *n == name) {
+        Some((_, f, _)) => {
+            if let Err(e) = f(rest) {
+                eprintln!("{name}: {e}");
+                exit(1);
+            }
+        }
+        None => {
+            eprintln!("toolbox: unknown applet '{name}'");
+            help();
+            exit(127);
+        }
+    }
+}
